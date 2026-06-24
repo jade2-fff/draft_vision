@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 3.10)
+project(dart_standalone)
+set(CMAKE_CXX_STANDARD 17)
+
+find_package(OpenCV REQUIRED)
+
+add_executable(dart
+    dart_easy.cpp
+    serial_protocol.cpp
+    dart_detector.cpp
+    dart_aimer.cpp
+)
+target_link_libraries(dart ${OpenCV_LIBS})
