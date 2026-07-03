@@ -11,6 +11,12 @@
 #include <cmath>
 #include <cstring>
 
+// ── 串口包录制钩子（可选，由 main 注入） ──
+static SerialRecorderHooks g_recorder_hooks;
+void serial_set_recorder_hooks(const SerialRecorderHooks &hooks) {
+    g_recorder_hooks = hooks;
+}
+
 // ═══════════════════════════════════════════
 // CRC16 查表法（多项式 0x1021，初始值 0xFFFF）
 // 直接复用下位机 USB_usart.c 的 CRC16_TABLE
@@ -121,26 +127,55 @@ void serial_send_packet(int fd, float v1, float v2, float v3) {
 
     uint8_t packet[TOTAL_PACKET_SIZE];
     packet_build(payload, packet);
-    write(fd, packet, TOTAL_PACKET_SIZE);
+
+    // 短写重试
+    size_t sent = 0;
+    while (sent < TOTAL_PACKET_SIZE) {
+        ssize_t n = write(fd, packet + sent, TOTAL_PACKET_SIZE - sent);
+        if (n <= 0) break;
+        sent += size_t(n);
+    }
+
+    if (g_recorder_hooks.on_tx) g_recorder_hooks.on_tx(packet, TOTAL_PACKET_SIZE);
 }
+
+// 每个 fd 一个接收环形缓冲（CRC 滑动对齐用）
+#include <unordered_map>
+#include <vector>
+static std::unordered_map<int, std::vector<uint8_t>> g_rx_buf;
 
 bool serial_recv_packet(int fd, float &v1, float &v2, float &v3) {
     if (fd < 0) return false;
 
-    uint8_t buf[TOTAL_PACKET_SIZE];
-    int n = read(fd, buf, TOTAL_PACKET_SIZE);
-    if (n < TOTAL_PACKET_SIZE) return false;
+    auto &buf = g_rx_buf[fd];
 
-    uint16_t recv_crc = buf[DATA_PAYLOAD_SIZE] | (buf[DATA_PAYLOAD_SIZE + 1] << 8);
-    if (crc16_calculate(buf, DATA_PAYLOAD_SIZE) != recv_crc) return false;
+    // 追加本次读到的新字节（非阻塞）
+    uint8_t tmp[256];
+    ssize_t n;
+    while ((n = read(fd, tmp, sizeof(tmp))) > 0) {
+        buf.insert(buf.end(), tmp, tmp + n);
+    }
 
-    int32_t i1, i2, i3;
-    memcpy(&i1, &buf[0], sizeof(i1));
-    memcpy(&i2, &buf[4], sizeof(i2));
-    memcpy(&i3, &buf[8], sizeof(i3));
+    // 滑动窗口找 14 字节使 CRC 通过的帧
+    while (buf.size() >= TOTAL_PACKET_SIZE) {
+        uint16_t recv_crc = buf[DATA_PAYLOAD_SIZE] | (buf[DATA_PAYLOAD_SIZE + 1] << 8);
+        if (crc16_calculate(buf.data(), DATA_PAYLOAD_SIZE) == recv_crc) {
+            int32_t i1, i2, i3;
+            memcpy(&i1, &buf[0], sizeof(i1));
+            memcpy(&i2, &buf[4], sizeof(i2));
+            memcpy(&i3, &buf[8], sizeof(i3));
+            v1 = i1 / 100.0f;
+            v2 = i2 / 100.0f;
+            v3 = i3 / 100.0f;
 
-    v1 = i1 / 100.0f;
-    v2 = i2 / 100.0f;
-    v3 = i3 / 100.0f;
-    return true;
+            if (g_recorder_hooks.on_rx) g_recorder_hooks.on_rx(buf.data(), TOTAL_PACKET_SIZE);
+            buf.erase(buf.begin(), buf.begin() + TOTAL_PACKET_SIZE);
+            return true;
+        }
+        buf.erase(buf.begin());   // 错位 1 字节继续找
+    }
+
+    // 防爆：缓冲过长（一直对不齐）截断
+    if (buf.size() > 256) buf.clear();
+    return false;
 }

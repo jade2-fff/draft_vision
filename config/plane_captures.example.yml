@@ -1,0 +1,28 @@
+%YAML:1.0
+# 多位置平面标定示例。
+# 相机和目标平面保持不动，只移动标定板。
+# board_center_mm 是棋盘格中心在目标平面坐标系下的位置：X 向右为正，Y 向上为正，单位 mm。
+# board_yaw_deg 是棋盘格在目标平面内的旋转角；保持水平时填 0。
+corners_x: 9
+corners_y: 6
+square_mm: 50.0
+captures:
+  - image: captures/left_top.jpg
+    board_center_mm: [-600.0, 400.0]
+    board_yaw_deg: 0.0
+
+  - image: captures/right_top.jpg
+    board_center_mm: [600.0, 400.0]
+    board_yaw_deg: 0.0
+
+  - image: captures/center.jpg
+    board_center_mm: [0.0, 0.0]
+    board_yaw_deg: 0.0
+
+  - image: captures/left_bottom.jpg
+    board_center_mm: [-600.0, -400.0]
+    board_yaw_deg: 0.0
+
+  - image: captures/right_bottom.jpg
+    board_center_mm: [600.0, -400.0]
+    board_yaw_deg: 0.0

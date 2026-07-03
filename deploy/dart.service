@@ -1,0 +1,16 @@
+[Unit]
+Description=Dart Standalone - RoboMaster 飞镖自瞄
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/home/jade/Desktop/dart_standalone/build/dart
+WorkingDirectory=/home/jade/Desktop/dart_standalone
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=default.target
