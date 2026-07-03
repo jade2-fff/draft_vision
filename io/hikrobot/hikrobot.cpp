@@ -77,6 +77,7 @@ void HikRobot::capture_start() {
     set_enum_value("BalanceWhiteAuto", MV_BALANCEWHITE_AUTO_CONTINUOUS);
     set_enum_value("ExposureAuto", MV_EXPOSURE_AUTO_MODE_OFF);
     set_enum_value("GainAuto", MV_GAIN_MODE_OFF);
+    set_enum_value("AcquisitionMode", MV_ACQ_MODE_CONTINUOUS);
     set_enum_value("TriggerMode", MV_TRIGGER_MODE_OFF);
     set_float_value("ExposureTime", exposure_us_);
     set_float_value("Gain", gain_);
@@ -90,10 +91,17 @@ void HikRobot::capture_start() {
     capture_thread_ = std::thread([this] {
         capturing_ = true;
         MV_FRAME_OUT raw{};
+        int no_data_count = 0;
         while (!capture_quit_) {
             std::this_thread::sleep_for(1ms);
-            unsigned int ret = MV_CC_GetImageBuffer(handle_, &raw, 100);
+            unsigned int ret = MV_CC_GetImageBuffer(handle_, &raw, 1000);
+            if (ret == MV_E_NODATA) {
+                if (++no_data_count % 30 == 0)
+                    std::cerr << "[HikRobot] waiting for image data..." << std::endl;
+                continue;
+            }
             if (ret != MV_OK) { std::cerr << "[HikRobot] GetImageBuffer failed: 0x" << std::hex << ret << std::endl; break; }
+            no_data_count = 0;
 
             auto timestamp = std::chrono::steady_clock::now();
             cv::Mat src(cv::Size(raw.stFrameInfo.nWidth, raw.stFrameInfo.nHeight), CV_8U, raw.pBufAddr);
