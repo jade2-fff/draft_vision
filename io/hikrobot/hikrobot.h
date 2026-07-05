@@ -40,6 +40,13 @@ public:
 
     bool is_capturing() const { return capturing_; }
 
+    /** 运行时设曝光（毫秒），钳制到 [0.1,100]，重连后保持 */
+    void set_exposure(double exposure_ms);
+    /** 运行时设增益，钳制到 [0,40]，重连后保持 */
+    void set_gain(double gain);
+    double exposure_ms() const { return exposure_us_ / 1e3; }
+    double gain() const { return gain_; }
+
 private:
     struct CameraData {
         cv::Mat img;
@@ -53,8 +60,9 @@ private:
     void set_vid_pid(const std::string &vid_pid);
     void reset_usb() const;
 
-    double exposure_us_;
-    double gain_;
+    std::atomic<double> exposure_us_;
+    std::atomic<double> gain_;
+    std::mutex          param_mtx_;   // 保护运行时改 handle 参数
     int    vid_ = -1, pid_ = -1;
 
     void  *handle_ = nullptr;   // MV_CC_HANDLE

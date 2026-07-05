@@ -59,6 +59,22 @@ bool HikRobot::read(cv::Mat &img, std::chrono::steady_clock::time_point &timesta
     return true;
 }
 
+void HikRobot::set_exposure(double exposure_ms) {
+    if (exposure_ms < 0.1)   exposure_ms = 0.1;
+    if (exposure_ms > 100.0) exposure_ms = 100.0;
+    exposure_us_ = exposure_ms * 1e3;
+    std::lock_guard<std::mutex> lk(param_mtx_);
+    if (handle_) set_float_value("ExposureTime", exposure_us_);
+}
+
+void HikRobot::set_gain(double gain) {
+    if (gain < 0.0)  gain = 0.0;
+    if (gain > 40.0) gain = 40.0;
+    gain_ = gain;
+    std::lock_guard<std::mutex> lk(param_mtx_);
+    if (handle_) set_float_value("Gain", gain_);
+}
+
 void HikRobot::capture_start() {
     capturing_   = false;
     capture_quit_ = false;
@@ -79,8 +95,11 @@ void HikRobot::capture_start() {
     set_enum_value("GainAuto", MV_GAIN_MODE_OFF);
     set_enum_value("AcquisitionMode", MV_ACQ_MODE_CONTINUOUS);
     set_enum_value("TriggerMode", MV_TRIGGER_MODE_OFF);
-    set_float_value("ExposureTime", exposure_us_);
-    set_float_value("Gain", gain_);
+    {
+        std::lock_guard<std::mutex> lk(param_mtx_);
+        set_float_value("ExposureTime", exposure_us_);   // 重连后下发最新值
+        set_float_value("Gain", gain_);
+    }
     MV_CC_SetFrameRate(handle_, 150);
 
     ret = MV_CC_StartGrabbing(handle_);

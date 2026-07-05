@@ -1,0 +1,316 @@
+飞镖视觉平面距离标定说明
+========================
+
+核心目标
+--------
+
+程序最终发给下位机的两个值是目标平面上的真实物理距离：
+
+  yaw 字段   = dx_cm  水平距离，右为正，单位 厘米
+  pitch 字段 = dy_cm  竖直距离，上为正，单位 厘米
+  mode       = 0 无有效目标 / 1 控制不开火 / 2 控制且开火
+
+注意：
+
+  这两个距离不是二值化图像里的像素值。
+  这两个距离不是 HSV mask 平面上的坐标。
+  这两个距离不是角度。
+
+它们是相机射线与真实目标平面求交得到的物理距离。
+
+只有完成真实标定后，dx_cm/dy_cm 才是真实物理值。
+没有标定文件时，程序发 0,0，mode=0，PV=0。
+
+
+标定是一次性的（重要）
+----------------------
+
+生成标定文件的命令只需要跑一次：
+
+  ./build_zcode/calibrate_plane_pose --multi config/plane_captures.yml config/dart_plane_pose.yml
+
+它会生成：
+
+  config/dart_plane_pose.yml
+
+之后主程序每次启动会自动读取这个文件，不用再跑标定命令。
+
+只有下面情况变化时，才需要重新标定：
+
+  相机位置变化
+  相机角度变化
+  相机焦距/分辨率变化
+  目标平面位置变化
+  车/发射点位置变化
+  相机支架松动/被撞
+
+日常开机、重启、开关服务，都不需要重新标定。
+
+
+坐标系定义
+----------
+
+目标平面坐标系：
+
+  靶面中心 = (0, 0, 0)
+  X 向右为正
+  Y 向上为正
+  Z = 0
+  单位 mm
+
+
+================================================
+完整标定操作流程
+================================================
+
+
+第一步：停止服务（避免抢相机）
+------------------------------
+
+  systemctl --user stop dart
+  pkill -9 dart
+
+
+第二步：手动运行程序，用 c 键拍标定图
+-------------------------------------
+
+  cd ~/Desktop/dart_standalone_new
+  ./build_zcode/dart
+
+窗口里会显示提示：
+
+  Exp/Gain: 4.5ms 16.0  [+/- exp, ][ gain]
+  [c] save calib frame -> captures/
+
+
+【重要】标定看不清标定板时，先调曝光/增益：
+
+  默认曝光很低（4.5ms），是为看绿色光源压暗的，
+  标定看普通标定板会太黑。用下面按键实时调亮：
+
+    +  或  =    曝光 +2ms（画面变亮）
+    -          曝光 -2ms（画面变暗）
+    ]          增益 +2
+    [          增益 -2
+
+  HUD 上 Exp/Gain 那行会实时显示当前值，
+  控制台也会打印，例如：
+
+    [Cam] exposure=20.0ms gain=16.0
+
+  操作建议：
+    一直按 + 加曝光、按 ] 加增益，直到棋盘格清晰可见，
+    再按 c 拍图。曝光范围 0.1~100ms，增益 0~40，
+    调过头画面会过曝发白，适当回调。
+
+  标定拍完后，务必把曝光调回小值（约 4.5ms）看绿光，
+  否则比赛检测绿色光源会因过亮失效。
+
+
+拍图操作：
+
+  1. 把标定板放到 25m 目标平面的第一个位置（例如左上）
+  2. 标定板贴紧目标光源平面，保持水平
+  3. 先用 +/]/-/[ 把画面调到能看清棋盘格
+  4. 在相机窗口按 c，保存一张无 HUD 原图
+  5. 移动标定板到下一个位置，再按 c
+  6. 依次拍完所有位置（建议 5~9 个）
+  7. 拍完按 - 把曝光调回约 4.5ms，再按 q 退出
+
+每次按 c 会打印：
+
+  [main] Saved calibration frame: captures/capture_00.jpg
+  [main] Saved calibration frame: captures/capture_01.jpg
+  ...
+
+推荐拍摄位置：
+
+  左上      右上
+
+      中心
+
+  左下      右下
+
+如果时间允许，推荐 9 个位置：
+
+  左上   上中   右上
+  左中   中心   右中
+  左下   下中   右下
+
+
+第三步：准备配置文件
+--------------------
+
+  cd ~/dart_standalone_new
+  cp config/plane_captures.example.yml config/plane_captures.yml
+  nano config/plane_captures.yml
+
+配置示例：
+
+  %YAML:1.0
+  corners_x: 9
+  corners_y: 6
+  square_mm: 50.0
+  captures:
+    - image: captures/capture_00.jpg
+      board_center_mm: [-600.0, 400.0]
+      board_yaw_deg: 0.0
+
+    - image: captures/capture_01.jpg
+      board_center_mm: [600.0, 400.0]
+      board_yaw_deg: 0.0
+
+    - image: captures/capture_02.jpg
+      board_center_mm: [0.0, 0.0]
+      board_yaw_deg: 0.0
+
+    - image: captures/capture_03.jpg
+      board_center_mm: [-600.0, -400.0]
+      board_yaw_deg: 0.0
+
+    - image: captures/capture_04.jpg
+      board_center_mm: [600.0, -400.0]
+      board_yaw_deg: 0.0
+
+参数说明：
+
+  corners_x       棋盘格横向内角点数量（不是格子数量）
+  corners_y       棋盘格纵向内角点数量（不是格子数量）
+  square_mm       每个格子真实边长，单位 mm
+  image           该位置拍到的图片路径（按第二步实际文件名）
+  board_center_mm 标定板中心在目标平面坐标系下的位置 [X,Y]，单位 mm
+  board_yaw_deg   标定板旋转角，水平时填 0
+
+
+第四步：生成标定文件（只跑一次）
+--------------------------------
+
+  cd ~/dart_standalone_new
+  ./build_zcode/calibrate_plane_pose --multi config/plane_captures.yml config/dart_plane_pose.yml
+
+成功后生成：
+
+  config/dart_plane_pose.yml
+
+同时每张图旁边生成预览图：
+
+  captures/capture_00.jpg.preview.jpg
+  captures/capture_01.jpg.preview.jpg
+  ...
+
+必须打开预览图，确认棋盘格角点检测正确。
+角点画错的图不能用，需要重拍。
+
+
+第五步：运行程序验证
+--------------------
+
+手动运行：
+
+  cd ~/dart_standalone_new
+  ./build_zcode/dart
+
+看日志或 HUD：
+
+  PV: 1      平面距离有效
+  PV: 0      无效（无目标/未标定/求交失败）
+
+方向检查：
+
+  绿灯在镗准线右边：dx 为正
+  绿灯在镗准线左边：dx 为负
+  绿灯在镗准线上方：dy 为正
+  绿灯在镗准线下方：dy 为负
+  绿灯接近镗准线：  dx/dy 接近 0
+
+
+第六步：启动自启动服务
+----------------------
+
+验证没问题后，按 q 退出手动程序，再启动服务：
+
+  systemctl --user restart dart
+  journalctl --user -u dart -f
+
+
+================================================
+命令速查
+================================================
+
+停服务：
+  systemctl --user stop dart
+  pkill -9 dart
+
+手动运行 / 拍标定图（按 c 存图，q 退出）：
+  cd ~/Desktop/dart_standalone_new
+  ./build_zcode/dart
+
+运行中按键：
+  +  或  =   曝光 +2ms（调亮，标定看板子用）
+  -          曝光 -2ms（调暗，看绿光用）
+  ]          增益 +2
+  [          增益 -2
+  c          保存当前帧到 captures/
+  r          开/关录像
+  q          退出
+
+生成标定文件（只跑一次）：
+  ./build_zcode/calibrate_plane_pose --multi config/plane_captures.yml config/dart_plane_pose.yml
+
+启动服务：
+  systemctl --user restart dart
+
+查看日志：
+  journalctl --user -u dart -f
+
+
+================================================
+常见错误
+================================================
+
+1. PV 一直是 0
+
+  没有 config/dart_plane_pose.yml
+  或标定未完成
+  或没识别到绿灯
+  或相机射线与平面求交失败
+
+2. 棋盘格检测失败
+
+  图像太糊
+  棋盘格太小（25m 建议用大棋盘格）
+  曝光太亮/太暗
+  棋盘格反光
+  corners_x/corners_y 内角点数填错
+
+3. 距离偏差大
+
+  board_center_mm 量错
+  square_mm 填错
+  标定板没贴在目标光源平面
+  相机标定后动过
+  图片顺序和位置不对应
+
+4. EnumDevices failed: 0x80000006
+
+  同时运行了服务和手动程序，两个进程抢相机
+  调试前先执行：
+    systemctl --user stop dart
+    pkill -9 dart
+
+5. 相机/目标位置变了
+
+  必须重新拍标定图并重新生成 dart_plane_pose.yml
+
+
+================================================
+重要前提
+================================================
+
+1. 下位机需按 厘米距离 解析 yaw/pitch 字段，不再当角度。
+
+2. dx_cm/dy_cm 只有在标定真实、相机内参准确、
+   标定板在真实目标平面上时，才是真实物理距离。
+
+3. 标定命令只跑一次，生成的 yaml 长期有效，
+   除非相机或目标位置变化。

@@ -2,12 +2,15 @@
  * @file dart_standalone.cpp
  * @brief 飞镖自瞄 — 绿色光源检测 + 角度/平面距离解算 + 串口 + 内录 + 可视化
  *
- * 管线: USB相机 → HSV+亮核+亚像素质心 → confirmer确认 → solver角度/平面距离 → 串口发平面偏差
- * 单串口(飞镖无云台): /dev/ttyACM0
- *   上位机→下位机: plane_dx_mm/plane_dy_mm/valid
- *   下位机→上位机: pitch/yaw/roll (度)
+ * 管线: USB相机 → 检测 → PnP平面求交 → 串口发 VisionToGimbal (dx/dy/mode)
+ * 单串口: /dev/ttyACM0
+ *   上位机→下位机: VisionToGimbal (0x50头, yaw字段=dx_cm, pitch字段=dy_cm, mode)
+ *     dx/dy = 目标平面上相对镗准线的真实物理距离(厘米)，右/上为正
+ *   下位机→上位机: GimbalToVision (0x53头, yaw/pitch rad, q等)
  */
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -67,6 +70,7 @@ int main() {
 
     cv::Mat frame, dbg;
     int fc = 0;
+    int capture_id = 0;   // 标定截图计数（按 c 保存无 HUD 原图）
     float cur_pitch = 0, cur_yaw = 0, cur_roll = 0;
 
     while (true) {
@@ -88,17 +92,29 @@ int main() {
         // 3. 瞄准
         AimCommand cmd = aimer.aim(tgt);
 
-        // 4. 收姿态 (非阻塞，滑动对齐)
-        float p, y, r;
-        if (serial_recv_attitude(fd, p, y, r)) {
-            cur_pitch = p; cur_yaw = y; cur_roll = r;
+        // 4. 收姿态 (非阻塞，0x53帧头+CRC校验)
+        float rx_yaw, rx_pitch;
+        if (serial_recv_gimbal_state(fd, rx_yaw, rx_pitch)) {
+            cur_yaw   = rx_yaw   * 180.0 / M_PI;
+            cur_pitch = rx_pitch * 180.0 / M_PI;
+            cur_roll  = 0;  // GimbalToVision 不含 roll
         }
 
-        // 5. 发目标平面偏差信号 dx/dy/valid（mm/mm/1或0）
-        serial_send_plane_offset(fd,
-                                 tgt.plane_valid ? tgt.plane_offset_mm.x : 0.0f,
-                                 tgt.plane_valid ? tgt.plane_offset_mm.y : 0.0f,
-                                 tgt.plane_valid ? 1.0f : 0.0f);
+        // 5. 发 VisionToGimbal (yaw字段=dx_cm, pitch字段=dy_cm, mode 0/1/2)
+        //    发送的是 solver 由 PnP 射线-平面求交得到的目标平面真实物理距离(mm→cm)，
+        //    不是像素/二值化坐标，也不是角度。plane_valid 为假时发 0,0,mode=0。
+        {
+            uint8_t mode  = 0;
+            float   dx_cm = 0;
+            float   dy_cm = 0;
+
+            if (tgt.found && tgt.plane_valid) {
+                mode  = cmd.fire ? 2 : 1;
+                dx_cm = tgt.plane_offset_mm.x / 10.0f;   // mm → cm，右为正
+                dy_cm = tgt.plane_offset_mm.y / 10.0f;   // mm → cm，上为正
+            }
+            serial_send_gimbal_cmd(fd, mode, dx_cm, dy_cm);
+        }
 
         // 6. 可视化 ───────────────────────────────
         frame.copyTo(dbg);
@@ -142,22 +158,26 @@ int main() {
             tgt.plane_valid ? cv::Scalar{0,255,0} : cv::Scalar{120,120,120});
         put(6, "Fire:  " + std::string(cmd.fire ? "ON" : "OFF"),
             cmd.fire ? cv::Scalar{0,0,255} : cv::Scalar{120,120,120});
-        put(7, "IMU P/Y/R: " + std::to_string(cur_pitch).substr(0,5) + " "
-                  + std::to_string(cur_yaw).substr(0,5) + " "
-                  + std::to_string(cur_roll).substr(0,5));
+        put(7, "IMU P/Y: " + std::to_string(cur_pitch).substr(0,5) + " "
+                  + std::to_string(cur_yaw).substr(0,5) + " deg");
         put(8, std::string("REC: ") + (recording ? "ON " : "OFF") + " [r toggles]",
             recording ? cv::Scalar{0,0,255} : cv::Scalar{120,120,120});
+        put(9, "Exp/Gain: " + std::to_string(camera.exposure_ms()).substr(0,5) + "ms "
+                  + std::to_string(camera.gain()).substr(0,4)
+                  + "  [+/- exp, ][ gain]");
+        put(10, "[c] save calib frame -> captures/");
 
         // 录像（带 HUD 的画面）
         if (recording && recorder)
             recorder->record(dbg, cmd.yaw_err, cmd.pitch_err, cmd.fire ? 1.0f : 0.0f, tgt.confidence);
 
         if (fc % 30 == 0) {
+            // 串口实际发送 dx/dy 为 cm；此处 dx/dy 打印为 mm 便于交叉验证
             std::cout << "[Dart] #" << fc
                       << (tgt.found ? " yaw=" + std::to_string(cmd.yaw_err).substr(0,6)
                                   + " pitch=" + std::to_string(cmd.pitch_err).substr(0,6)
-                                  + " dx=" + std::to_string(tgt.plane_offset_mm.x).substr(0,7)
-                                  + " dy=" + std::to_string(tgt.plane_offset_mm.y).substr(0,7)
+                                  + " dx_mm=" + std::to_string(tgt.plane_offset_mm.x).substr(0,7)
+                                  + " dy_mm=" + std::to_string(tgt.plane_offset_mm.y).substr(0,7)
                                   + " pv=" + std::string(tgt.plane_valid ? "1" : "0")
                                   + (cmd.fire ? " FIRE" : "")
                                 : " NO_TARGET")
@@ -170,6 +190,36 @@ int main() {
 
         int key = cv::waitKey(1);
         if (key == 'q') break;
+        if (key == '+' || key == '=') {
+            camera.set_exposure(camera.exposure_ms() + 2.0);
+            std::cout << "[Cam] exposure=" << camera.exposure_ms()
+                      << "ms gain=" << camera.gain() << std::endl;
+        }
+        if (key == '-' || key == '_') {
+            camera.set_exposure(camera.exposure_ms() - 2.0);
+            std::cout << "[Cam] exposure=" << camera.exposure_ms()
+                      << "ms gain=" << camera.gain() << std::endl;
+        }
+        if (key == ']') {
+            camera.set_gain(camera.gain() + 2.0);
+            std::cout << "[Cam] exposure=" << camera.exposure_ms()
+                      << "ms gain=" << camera.gain() << std::endl;
+        }
+        if (key == '[') {
+            camera.set_gain(camera.gain() - 2.0);
+            std::cout << "[Cam] exposure=" << camera.exposure_ms()
+                      << "ms gain=" << camera.gain() << std::endl;
+        }
+        if (key == 'c') {
+            // 保存无 HUD 的原始帧，供 calibrate_plane_pose 使用
+            system("mkdir -p captures");
+            char path[128];
+            std::snprintf(path, sizeof(path), "captures/capture_%02d.jpg", capture_id++);
+            if (cv::imwrite(path, frame))
+                std::cout << "[main] Saved calibration frame: " << path << std::endl;
+            else
+                std::cerr << "[main] Failed to save: " << path << std::endl;
+        }
         if (key == 'r') {
             recording = !recording;
             if (recording) {
