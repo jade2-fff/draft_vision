@@ -30,6 +30,10 @@ struct DartTarget {
     cv::Point2f plane_offset_mm{0.f, 0.f};  // 相对镗准线交点的平面偏差，右/上为正
     bool        plane_valid = false;        // 外参有效且求交成功
 
+    // solver 填充：目标点在相机坐标系下的坐标（原点=相机/发射点，mm）
+    float cam_x_mm     = 0.f;   // 水平偏移，右为正
+    float cam_depth_mm = 0.f;   // 前向深度（相机 Z 轴）
+
     /** 归一化中心偏移 [-1,1]（保留给旧调用方/调试） */
     float cx_norm(int imgW) const { return imgW>0 ? center.x/float(imgW)*2.f-1.f : 0.f; }
     float cy_norm(int imgH) const { return imgH>0 ? center.y/float(imgH)*2.f-1.f : 0.f; }

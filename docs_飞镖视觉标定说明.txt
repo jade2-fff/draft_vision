@@ -1,316 +1,276 @@
-飞镖视觉平面距离标定说明
-========================
+========================================================
+飞镖视觉标定说明（内参 + 外参 完整流程）
+========================================================
 
-核心目标
---------
-
-程序最终发给下位机的两个值是目标平面上的真实物理距离：
-
-  yaw 字段   = dx_cm  水平距离，右为正，单位 厘米
-  pitch 字段 = dy_cm  竖直距离，上为正，单位 厘米
-  mode       = 0 无有效目标 / 1 控制不开火 / 2 控制且开火
-
-注意：
-
-  这两个距离不是二值化图像里的像素值。
-  这两个距离不是 HSV mask 平面上的坐标。
-  这两个距离不是角度。
-
-它们是相机射线与真实目标平面求交得到的物理距离。
-
-只有完成真实标定后，dx_cm/dy_cm 才是真实物理值。
-没有标定文件时，程序发 0,0，mode=0，PV=0。
+程序发给下位机的三个值：
+  x = 目标相对相机的水平偏移(mm)，右为正
+  y = 前向深度(mm)
+  z = valid，1=有目标 0=无目标
+下位机自己算 yaw = atan2(x, y)，并自行判断到位停止。
+（垂直分量已丢弃，所以绿灯在镗准线下方的机械偏移不影响 yaw）
 
 
-标定是一次性的（重要）
-----------------------
+========================================================
+重要：标定顺序
+========================================================
 
-生成标定文件的命令只需要跑一次：
+必须先标内参(B)，再标外参(A)。
+外参用 PnP，依赖内参；内参没标好，外参也不准。
 
-  ./build_zcode/calibrate_plane_pose --multi config/plane_captures.yml config/dart_plane_pose.yml
+  第一步：相机内参标定  → config/dart_intrinsics.yml
+  第二步：平面外参标定  → config/dart_plane_pose.yml
 
-它会生成：
-
-  config/dart_plane_pose.yml
-
-之后主程序每次启动会自动读取这个文件，不用再跑标定命令。
-
-只有下面情况变化时，才需要重新标定：
-
-  相机位置变化
-  相机角度变化
-  相机焦距/分辨率变化
-  目标平面位置变化
-  车/发射点位置变化
-  相机支架松动/被撞
-
-日常开机、重启、开关服务，都不需要重新标定。
+内参标定：标定板放在相机近处(1~3m)，多角度多张。
+外参标定：标定板放在 25m 目标平面上。
+两步用的照片不一样，不要混用。
 
 
-坐标系定义
-----------
+========================================================
+标定板参数（先量清楚）
+========================================================
 
-目标平面坐标系：
+corners_x = 横向内角点数（不是格子数，是内部交叉点数）
+corners_y = 纵向内角点数
+square_mm = 每个格子真实边长(mm)
 
-  靶面中心 = (0, 0, 0)
-  X 向右为正
-  Y 向上为正
-  Z = 0
-  单位 mm
-
-
-================================================
-完整标定操作流程
-================================================
+例：10列×7行格子的板 → 内角点 9×6
+    本项目示例用 10 7 50（按你实际板子填）
 
 
-第一步：停止服务（避免抢相机）
-------------------------------
+========================================================
+公共操作：拍标定图（按 c 存图）
+========================================================
 
+先停服务，避免抢相机：
   systemctl --user stop dart
   pkill -9 dart
+  sleep 2
 
-
-第二步：手动运行程序，用 c 键拍标定图
--------------------------------------
-
+运行程序：
   cd ~/Desktop/dart_standalone_new
   ./build_zcode/dart
 
-窗口里会显示提示：
+运行中按键：
+  +  或  =   曝光 +2ms（调亮，看清标定板）
+  -          曝光 -2ms（调暗，看绿光用）
+  ]          增益 +2
+  [          增益 -2
+  c          保存当前帧到 captures/
+  q          退出
 
-  Exp/Gain: 4.5ms 16.0  [+/- exp, ][ gain]
-  [c] save calib frame -> captures/
-
-
-【重要】标定看不清标定板时，先调曝光/增益：
-
-  默认曝光很低（4.5ms），是为看绿色光源压暗的，
-  标定看普通标定板会太黑。用下面按键实时调亮：
-
-    +  或  =    曝光 +2ms（画面变亮）
-    -          曝光 -2ms（画面变暗）
-    ]          增益 +2
-    [          增益 -2
-
-  HUD 上 Exp/Gain 那行会实时显示当前值，
-  控制台也会打印，例如：
-
-    [Cam] exposure=20.0ms gain=16.0
-
-  操作建议：
-    一直按 + 加曝光、按 ] 加增益，直到棋盘格清晰可见，
-    再按 c 拍图。曝光范围 0.1~100ms，增益 0~40，
-    调过头画面会过曝发白，适当回调。
-
-  标定拍完后，务必把曝光调回小值（约 4.5ms）看绿光，
-  否则比赛检测绿色光源会因过亮失效。
+看不清标定板就按 + 加曝光、] 加增益，直到棋盘格清晰，再按 c。
+每按一次 c 存一张：captures/capture_00.jpg, capture_01.jpg ...
 
 
-拍图操作：
+========================================================
+第一步：相机内参标定（B）
+========================================================
 
-  1. 把标定板放到 25m 目标平面的第一个位置（例如左上）
-  2. 标定板贴紧目标光源平面，保持水平
-  3. 先用 +/]/-/[ 把画面调到能看清棋盘格
-  4. 在相机窗口按 c，保存一张无 HUD 原图
-  5. 移动标定板到下一个位置，再按 c
-  6. 依次拍完所有位置（建议 5~9 个）
-  7. 拍完按 - 把曝光调回约 4.5ms，再按 q 退出
+目的：算出真实 fx/fy/cx/cy 和畸变，让深度算得准。
 
-每次按 c 会打印：
+1. 停服务
+   systemctl --user stop dart
+   pkill -9 dart
+   sleep 2
 
-  [main] Saved calibration frame: captures/capture_00.jpg
-  [main] Saved calibration frame: captures/capture_01.jpg
-  ...
+2. 清空旧图
+   cd ~/Desktop/dart_standalone_new
+   rm -f captures/*.jpg
 
-推荐拍摄位置：
+3. 拍内参图（关键：标定板在相机近处 1~3m）
+   ./build_zcode/dart
 
-  左上      右上
+   拍摄要求：
+   - 标定板离相机 1~3m
+   - 换不同角度：正对、左倾、右倾、上仰、下俯
+   - 换不同位置：画面中心、四个角都要拍到
+   - 换不同远近
+   - 每个姿势按一次 c
+   - 一共拍 15~20 张
+   - 棋盘格要清晰、完整、不反光、不过曝
 
-      中心
+   拍完按 q 退出。
 
-  左下      右下
+4. 生成内参（假设 10×7 内角点、50mm 格）
+   ./build_zcode/calibrate_intrinsics 10 7 50 config/dart_intrinsics.yml captures/capture_*.jpg
 
-如果时间允许，推荐 9 个位置：
+   命令格式：
+   ./build_zcode/calibrate_intrinsics <corners_x> <corners_y> <square_mm> <输出yml> <图片...>
 
-  左上   上中   右上
-  左中   中心   右中
-  左下   下中   右下
+5. 看输出的 RMS 重投影误差
+   < 0.5  很好
+   < 1.0  可用
+   > 1.5  重拍（图太少/不清/角度不够）
 
+   还会打印 fx/fy/cx/cy，确认 cx/cy 大约在图像宽高的一半附近。
 
-第三步：准备配置文件
---------------------
-
-  cd ~/dart_standalone_new
-  cp config/plane_captures.example.yml config/plane_captures.yml
-  nano config/plane_captures.yml
-
-配置示例：
-
-  %YAML:1.0
-  corners_x: 9
-  corners_y: 6
-  square_mm: 50.0
-  captures:
-    - image: captures/capture_00.jpg
-      board_center_mm: [-600.0, 400.0]
-      board_yaw_deg: 0.0
-
-    - image: captures/capture_01.jpg
-      board_center_mm: [600.0, 400.0]
-      board_yaw_deg: 0.0
-
-    - image: captures/capture_02.jpg
-      board_center_mm: [0.0, 0.0]
-      board_yaw_deg: 0.0
-
-    - image: captures/capture_03.jpg
-      board_center_mm: [-600.0, -400.0]
-      board_yaw_deg: 0.0
-
-    - image: captures/capture_04.jpg
-      board_center_mm: [600.0, -400.0]
-      board_yaw_deg: 0.0
-
-参数说明：
-
-  corners_x       棋盘格横向内角点数量（不是格子数量）
-  corners_y       棋盘格纵向内角点数量（不是格子数量）
-  square_mm       每个格子真实边长，单位 mm
-  image           该位置拍到的图片路径（按第二步实际文件名）
-  board_center_mm 标定板中心在目标平面坐标系下的位置 [X,Y]，单位 mm
-  board_yaw_deg   标定板旋转角，水平时填 0
+6. 备份内参
+   cp config/dart_intrinsics.yml ~/dart_intrinsics_backup.yml
 
 
-第四步：生成标定文件（只跑一次）
---------------------------------
+========================================================
+第二步：平面外参标定（A）
+========================================================
 
-  cd ~/dart_standalone_new
-  ./build_zcode/calibrate_plane_pose --multi config/plane_captures.yml config/dart_plane_pose.yml
+目的：算出相机相对 25m 目标平面的位置姿态(外参)。
 
-成功后生成：
+前提：内参(第一步)已经标好，config/dart_intrinsics.yml 已存在。
 
-  config/dart_plane_pose.yml
+1. 停服务
+   systemctl --user stop dart
+   pkill -9 dart
+   sleep 2
 
-同时每张图旁边生成预览图：
+2. 清空旧图和旧外参
+   cd ~/Desktop/dart_standalone_new
+   rm -f captures/*.jpg config/dart_plane_pose.yml
 
-  captures/capture_00.jpg.preview.jpg
-  captures/capture_01.jpg.preview.jpg
-  ...
+3. 拍外参图（关键：标定板贴在 25m 目标平面上）
+   ./build_zcode/dart
 
-必须打开预览图，确认棋盘格角点检测正确。
-角点画错的图不能用，需要重拍。
+   拍摄要求：
+   - 相机固定在比赛位置，不要动
+   - 标定板贴在目标光源所在的那个平面上，保持水平
+   - 可以只拍 1 张（贴靶心），也可多位置拍几张更稳
+   - 每个位置按 c
+   - 按 q 退出
+
+4. 准备外参配置
+   cp config/plane_captures.example.yml config/plane_captures.yml
+   nano config/plane_captures.yml
+
+   填写：
+   corners_x / corners_y / square_mm  = 标定板参数
+   每张 image                          = 实际拍的文件名 captures/capture_00.jpg
+   每张 board_center_mm: [X, Y]        = 该张标定板中心在目标平面坐标系的真实位置(mm)
+   每张 board_yaw_deg                  = 标定板旋转角，水平填 0
+
+   目标平面坐标系：靶面中心=(0,0)，X向右为正，Y向上为正，单位 mm。
+   单张标定时 board_center_mm 填 [0.0, 0.0] 即可。
+
+5. 生成外参
+   ./build_zcode/calibrate_plane_pose --multi config/plane_captures.yml config/dart_plane_pose.yml
+
+   成功输出：Wrote config/dart_plane_pose.yml ... total_points=...
+   每张图旁生成 .preview.jpg，打开确认棋盘格角点画对了。
+
+6. 备份外参
+   cp config/dart_plane_pose.yml ~/dart_plane_pose_backup.yml
 
 
-第五步：运行程序验证
---------------------
+========================================================
+第三步：运行验证
+========================================================
 
-手动运行：
+1. 运行
+   cd ~/Desktop/dart_standalone_new
+   ./build_zcode/dart
 
-  cd ~/dart_standalone_new
-  ./build_zcode/dart
+2. 启动日志应出现（两个都要有）：
+   [Solver] camera intrinsics loaded: ... fx=... fy=... cx=... cy=...
+   [Solver] plane pose loaded: ... points=...
 
-看日志或 HUD：
+   如果内参没加载，会用默认占位值(800/320/240)，深度不准。
 
-  PV: 1      平面距离有效
-  PV: 0      无效（无目标/未标定/求交失败）
+3. 日志每帧打印：
+   x_mm=...  depth_mm=...  yaw=...  pv=1
 
-方向检查：
+4. 验证：
+   - 镗准线水平对准目标时，x_mm 应过 0（左负右正）
+   - depth_mm 应接近真实距离（25m 目标 约 25000mm）
+   - yaw = atan2(x, depth)，对准时接近 0
 
-  绿灯在镗准线右边：dx 为正
-  绿灯在镗准线左边：dx 为负
-  绿灯在镗准线上方：dy 为正
-  绿灯在镗准线下方：dy 为负
-  绿灯接近镗准线：  dx/dy 接近 0
+   depth 明显不对 → 内参没标好，重标第一步。
 
 
-第六步：启动自启动服务
-----------------------
+========================================================
+第四步：启动自启动服务
+========================================================
 
-验证没问题后，按 q 退出手动程序，再启动服务：
-
+验证 OK 后，按 q 退出手动程序，启动服务：
   systemctl --user restart dart
   journalctl --user -u dart -f
 
 
-================================================
+========================================================
+什么时候要重新标定
+========================================================
+
+重标内参(B)：换了相机、换了镜头、改了分辨率。
+重标外参(A)：相机位置/角度变了、目标平面位置变了、车/发射点位置变了。
+
+日常开机、重启、开关服务，都不需要重标。
+外参依赖内参，若重标内参，外参也要跟着重标。
+
+
+========================================================
 命令速查
-================================================
+========================================================
 
 停服务：
   systemctl --user stop dart
   pkill -9 dart
 
-手动运行 / 拍标定图（按 c 存图，q 退出）：
+拍图 / 手动运行（c 存图，q 退出，+/- 调曝光，][ 调增益）：
   cd ~/Desktop/dart_standalone_new
   ./build_zcode/dart
 
-运行中按键：
-  +  或  =   曝光 +2ms（调亮，标定看板子用）
-  -          曝光 -2ms（调暗，看绿光用）
-  ]          增益 +2
-  [          增益 -2
-  c          保存当前帧到 captures/
-  r          开/关录像
-  q          退出
+标内参（先做，近处多角度15~20张）：
+  ./build_zcode/calibrate_intrinsics 10 7 50 config/dart_intrinsics.yml captures/capture_*.jpg
 
-生成标定文件（只跑一次）：
+标外参（后做，标定板贴25m目标平面）：
   ./build_zcode/calibrate_plane_pose --multi config/plane_captures.yml config/dart_plane_pose.yml
 
 启动服务：
   systemctl --user restart dart
 
-查看日志：
+看日志：
   journalctl --user -u dart -f
 
+备份标定：
+  cp config/dart_intrinsics.yml ~/dart_intrinsics_backup.yml
+  cp config/dart_plane_pose.yml ~/dart_plane_pose_backup.yml
 
-================================================
+
+========================================================
 常见错误
-================================================
+========================================================
 
-1. PV 一直是 0
+1. 内参 RMS 太大(>1.5)
+   图太少 / 角度不够 / 棋盘格不清 / 过曝 / 内角点数填错
+   → 多拍、拍全画面各区域、多角度倾斜、调曝光
 
-  没有 config/dart_plane_pose.yml
-  或标定未完成
-  或没识别到绿灯
-  或相机射线与平面求交失败
+2. depth 数值明显不对
+   内参没标好或没加载。看启动日志有没有 camera intrinsics loaded。
 
-2. 棋盘格检测失败
+3. 棋盘格检测失败
+   图糊 / 太小 / 反光 / corners_x/corners_y 填错(填成格子数了)
 
-  图像太糊
-  棋盘格太小（25m 建议用大棋盘格）
-  曝光太亮/太暗
-  棋盘格反光
-  corners_x/corners_y 内角点数填错
+4. pv 一直 0
+   没有 dart_plane_pose.yml / 外参没标 / 没识别到目标
 
-3. 距离偏差大
+5. 相机打不开 EnumDevices failed: 0x80000006
+   同时跑了服务和手动程序，两个抢相机。
+   先 systemctl --user stop dart 再手动跑。
 
-  board_center_mm 量错
-  square_mm 填错
-  标定板没贴在目标光源平面
-  相机标定后动过
-  图片顺序和位置不对应
-
-4. EnumDevices failed: 0x80000006
-
-  同时运行了服务和手动程序，两个进程抢相机
-  调试前先执行：
-    systemctl --user stop dart
-    pkill -9 dart
-
-5. 相机/目标位置变了
-
-  必须重新拍标定图并重新生成 dart_plane_pose.yml
+6. 串口未连接
+   设备号变了。程序已自动检测 ttyACM0~3，插好下位机即可。
 
 
-================================================
-重要前提
-================================================
+========================================================
+下位机需要做的（转告下位机同学）
+========================================================
 
-1. 下位机需按 厘米距离 解析 yaw/pitch 字段，不再当角度。
+1. 下位机接收当前是注释状态，必须取消注释、启用接收，
+   否则 com.x/com.y/com.z 永远是 0。
 
-2. dx_cm/dy_cm 只有在标定真实、相机内参准确、
-   标定板在真实目标平面上时，才是真实物理距离。
+2. 字段映射：
+   com.x = 水平偏移(mm)，右为正
+   com.y = 深度(mm)          ← 深度在这里，不是 com.distance
+   com.z = valid，1有目标 0无目标
 
-3. 标定命令只跑一次，生成的 yaml 长期有效，
-   除非相机或目标位置变化。
+3. yaw = atan2(com.x, com.y)   用 com.y 当深度，别用 com.distance。
+
+4. 到位判断由下位机做：yaw 接近 0 就停，避免来回晃。
+
+5. 深度量程放大到 2.5万mm，解析仍是 /100。

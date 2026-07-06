@@ -21,11 +21,23 @@ HikRobot::HikRobot(double exposure_ms, double gain, const std::string &vid_pid)
     daemon_thread_ = std::thread([this] {
         std::cout << "[HikRobot] daemon thread started" << std::endl;
         capture_start();
+        int fail_count = 0;
         while (!daemon_quit_) {
             std::this_thread::sleep_for(100ms);
-            if (capturing_) continue;
+            if (capturing_) { fail_count = 0; continue; }
+
+            // 未在采集：温和重试，避免开机时疯狂 reset_usb 反而拖坏枚举
             capture_stop();
-            reset_usb();
+            ++fail_count;
+            // 每次重试间隔 1 秒，给相机/USB/SDK 就绪时间
+            std::this_thread::sleep_for(1000ms);
+            // 仅在连续多次失败后才做一次 USB 硬重置（每 5 次一次）
+            if (fail_count % 5 == 0) {
+                std::cerr << "[HikRobot] retry " << fail_count
+                          << ", resetting usb" << std::endl;
+                reset_usb();
+                std::this_thread::sleep_for(500ms);
+            }
             capture_start();
         }
         capture_stop();
@@ -69,7 +81,7 @@ void HikRobot::set_exposure(double exposure_ms) {
 
 void HikRobot::set_gain(double gain) {
     if (gain < 0.0)  gain = 0.0;
-    if (gain > 40.0) gain = 40.0;
+    if (gain > 15.0) gain = 15.0;   // MV-CA003 增益上限约 15
     gain_ = gain;
     std::lock_guard<std::mutex> lk(param_mtx_);
     if (handle_) set_float_value("Gain", gain_);
@@ -100,7 +112,7 @@ void HikRobot::capture_start() {
         set_float_value("ExposureTime", exposure_us_);   // 重连后下发最新值
         set_float_value("Gain", gain_);
     }
-    MV_CC_SetFrameRate(handle_, 150);
+    MV_CC_SetFrameRate(handle_, 100);
 
     ret = MV_CC_StartGrabbing(handle_);
     if (ret != MV_OK) { std::cerr << "[HikRobot] StartGrabbing failed: 0x" << std::hex << ret << std::endl; return; }
@@ -131,8 +143,15 @@ void HikRobot::capture_start() {
                 {PixelType_Gvsp_BayerRG8, cv::COLOR_BayerRG2RGB},
                 {PixelType_Gvsp_BayerGB8, cv::COLOR_BayerGB2RGB},
                 {PixelType_Gvsp_BayerBG8, cv::COLOR_BayerBG2RGB}};
+            auto it = type_map.find(raw.stFrameInfo.enPixelType);
+            if (it == type_map.end()) {
+                std::cerr << "[HikRobot] unsupported pixel type: 0x"
+                          << std::hex << raw.stFrameInfo.enPixelType << std::endl;
+                MV_CC_FreeImageBuffer(handle_, &raw);
+                continue;
+            }
             cv::Mat dst;
-            cv::cvtColor(src, dst, type_map.at(raw.stFrameInfo.enPixelType));
+            cv::cvtColor(src, dst, it->second);
 
             {
                 std::lock_guard<std::mutex> lk(queue_mtx_);

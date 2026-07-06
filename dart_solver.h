@@ -22,6 +22,9 @@ public:
     /** 设置相机内参（3x3）与畸变系数（1xN） */
     void set_camera(const cv::Mat &camera_matrix, const cv::Mat &distort_coeffs);
 
+    /** 从 yaml 加载相机内参（camera_matrix + distortion_coefficients） */
+    bool load_camera(const std::string &path);
+
     /** 设置镗准线像素坐标（默认画面中心） */
     void set_boresight(const cv::Point2f &bs);
 

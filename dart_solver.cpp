@@ -23,6 +23,29 @@ void DartSolver::set_camera(const cv::Mat &camera_matrix, const cv::Mat &distort
     distort_coeffs_ = distort_coeffs.clone();
 }
 
+bool DartSolver::load_camera(const std::string &path) {
+    cv::FileStorage fs(path, cv::FileStorage::READ);
+    if (!fs.isOpened()) {
+        std::cerr << "[Solver] camera intrinsics config not found: " << path << std::endl;
+        return false;
+    }
+    cv::Mat K, D;
+    fs["camera_matrix"] >> K;
+    fs["distortion_coefficients"] >> D;
+    if (K.empty() || K.rows != 3 || K.cols != 3) {
+        std::cerr << "[Solver] invalid camera_matrix in: " << path << std::endl;
+        return false;
+    }
+    K.convertTo(camera_matrix_, CV_64F);
+    if (!D.empty()) D.convertTo(distort_coeffs_, CV_64F);
+    std::cout << "[Solver] camera intrinsics loaded: " << path
+              << " fx=" << camera_matrix_.at<double>(0,0)
+              << " fy=" << camera_matrix_.at<double>(1,1)
+              << " cx=" << camera_matrix_.at<double>(0,2)
+              << " cy=" << camera_matrix_.at<double>(1,2) << std::endl;
+    return true;
+}
+
 void DartSolver::set_boresight(const cv::Point2f &bs) { boresight_ = bs; }
 
 bool DartSolver::set_plane_pose(const cv::Mat &rvec, const cv::Mat &tvec) {
@@ -139,6 +162,8 @@ bool DartSolver::intersect_plane_z0(const cv::Point2f &pixel, cv::Point2f &plane
 void DartSolver::solve(DartTarget &target) {
     target.plane_point_mm = cv::Point2f(0.f, 0.f);
     target.plane_offset_mm = cv::Point2f(0.f, 0.f);
+    target.cam_x_mm     = 0.f;
+    target.cam_depth_mm = 0.f;
     target.plane_valid = false;
 
     if (!target.found) {
@@ -163,6 +188,14 @@ void DartSolver::solve(DartTarget &target) {
         target.plane_point_mm = target_plane;
         target.plane_offset_mm = cv::Point2f(target_plane.x - boresight_plane.x,
                                              target_plane.y - boresight_plane.y);
+
+        // 把靶面交点转回相机坐标系：P_cam = R_cw * [x,y,0] + tvec
+        // 相机系 X=水平(右正)，Z=前向深度；原点=相机/发射点。
+        cv::Mat pw = (cv::Mat_<double>(3, 1) << double(target_plane.x),
+                                                double(target_plane.y), 0.0);
+        cv::Mat pc = R_cw_ * pw + tvec_;
+        target.cam_x_mm     = float(pc.at<double>(0, 0));   // 水平偏移
+        target.cam_depth_mm = float(pc.at<double>(2, 0));   // 前向深度
         target.plane_valid = true;
     }
 }

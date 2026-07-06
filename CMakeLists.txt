@@ -21,6 +21,10 @@ add_executable(calibrate_plane_pose
     calibrate_plane_pose.cpp
 )
 
+add_executable(calibrate_intrinsics
+    calibrate_intrinsics.cpp
+)
+
 # 海康 MVS SDK
 target_include_directories(dart PRIVATE io/hikrobot/include)
 target_link_directories(dart PRIVATE io/hikrobot/lib/amd64)
@@ -34,5 +38,9 @@ target_link_libraries(dart
 )
 
 target_link_libraries(calibrate_plane_pose
+    ${OpenCV_LIBS}
+)
+
+target_link_libraries(calibrate_intrinsics
     ${OpenCV_LIBS}
 )

@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -25,12 +26,22 @@
 #include "recorder.h"
 #include "io/hikrobot/hikrobot.h"
 
-static const char *PORT  = "/dev/ttyACM0";
 static const int   BAUD  = B115200;
+
+// 自动检测串口：依次尝试 /dev/ttyACM0..3，返回打开成功的 fd 和端口名
+static int serial_open_auto(std::string &opened_port) {
+    for (int i = 0; i < 4; ++i) {
+        std::string port = "/dev/ttyACM" + std::to_string(i);
+        int fd = serial_open(port.c_str(), BAUD);
+        if (fd >= 0) { opened_port = port; return fd; }
+    }
+    opened_port = "/dev/ttyACM0..3";
+    return -1;
+}
 
 // 海康相机参数
 static const double CAM_EXPOSURE_MS = 4.5;
-static const double CAM_GAIN        = 16.0;
+static const double CAM_GAIN        = 15.0;   // MV-CA003 增益上限约 15
 static const char  *CAM_VID_PID     = "2bdf:0001";
 
 // 串口包录制全局指针（供无捕获函数指针回调访问）
@@ -50,11 +61,13 @@ int main() {
 
     DartDetector detector;
     DartSolver   solver;
-    solver.load_plane_pose("config/dart_plane_pose.yml");
+    solver.load_camera("config/dart_intrinsics.yml");     // 真实内参（没有则用默认占位值）
+    solver.load_plane_pose("config/dart_plane_pose.yml"); // 外参（依赖内参，先加载内参）
     DartAimer    aimer;
 
-    int fd = serial_open(PORT, BAUD);
-    std::cout << (fd>=0 ? "[OK] 串口 " : "[WARN] 串口未连接 ") << PORT << std::endl;
+    std::string opened_port;
+    int fd = serial_open_auto(opened_port);
+    std::cout << (fd>=0 ? "[OK] 串口 " : "[WARN] 串口未连接 ") << opened_port << std::endl;
     std::cout << "[Dart] 飞镖自瞄启动 (r=录像 q=退出)" << std::endl;
 
     // ── 内录 ──
@@ -73,13 +86,30 @@ int main() {
     int capture_id = 0;   // 标定截图计数（按 c 保存无 HUD 原图）
     float cur_pitch = 0, cur_yaw = 0, cur_roll = 0;
 
+    // 看门狗：若启动后一直取不到帧（相机卡在坏的资源上下文 0x80000006），
+    // 直接退出，靠 systemd Restart=always 拉起一个全新进程重连。
+    const auto start_time = std::chrono::steady_clock::now();
+    bool got_first_frame = false;
+
     while (true) {
         std::chrono::steady_clock::time_point t;
         if (!camera.read(frame, t, 500)) {
             // 取帧超时（相机未连/掉线），仍处理按键避免卡死
             if (cv::waitKey(1) == 'q') break;
+            // 启动 20 秒内还没拿到第一帧 → 退出让 systemd 重启新进程
+            if (!got_first_frame) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - start_time).count();
+                if (elapsed > 20) {
+                    std::cerr << "[Dart] no frame in 20s, exiting for systemd restart"
+                              << std::endl;
+                    serial_close(fd);
+                    return 2;
+                }
+            }
             continue;
         }
+        got_first_frame = true;
         if (frame.empty()) continue;
         fc++;
 
@@ -92,28 +122,26 @@ int main() {
         // 3. 瞄准
         AimCommand cmd = aimer.aim(tgt);
 
-        // 4. 收姿态 (非阻塞，0x53帧头+CRC校验)
-        float rx_yaw, rx_pitch;
-        if (serial_recv_gimbal_state(fd, rx_yaw, rx_pitch)) {
-            cur_yaw   = rx_yaw   * 180.0 / M_PI;
-            cur_pitch = rx_pitch * 180.0 / M_PI;
-            cur_roll  = 0;  // GimbalToVision 不含 roll
+        // 4. 收下位机姿态 (pitch/yaw/roll，度；14字节协议)
+        {
+            float p, y, r;
+            if (serial_recv_attitude(fd, p, y, r)) {
+                cur_pitch = p; cur_yaw = y; cur_roll = r;
+            }
         }
 
-        // 5. 发 VisionToGimbal (yaw字段=dx_cm, pitch字段=dy_cm, mode 0/1/2)
-        //    发送的是 solver 由 PnP 射线-平面求交得到的目标平面真实物理距离(mm→cm)，
-        //    不是像素/二值化坐标，也不是角度。plane_valid 为假时发 0,0,mode=0。
+        // 5. 发相机坐标系 x_横向 / y_深度(mm) + valid（14字节协议，×100，0x1021 CRC）
+        //    x = 目标相对相机的水平偏移(右为正)，y = 前向深度，原点=相机/发射点。
+        //    下位机用 yaw=atan2(x, y) 解算偏航并自行判断到位。垂直分量已丢弃。
+        //    z(valid): 1=有目标, 0=无目标。无锁存/死区，直接发实时真实值。
         {
-            uint8_t mode  = 0;
-            float   dx_cm = 0;
-            float   dy_cm = 0;
-
+            float x_mm = 0, depth_mm = 0, valid = 0;
             if (tgt.found && tgt.plane_valid) {
-                mode  = cmd.fire ? 2 : 1;
-                dx_cm = tgt.plane_offset_mm.x / 10.0f;   // mm → cm，右为正
-                dy_cm = tgt.plane_offset_mm.y / 10.0f;   // mm → cm，上为正
+                x_mm     = tgt.cam_x_mm;       // 水平偏移，右为正
+                depth_mm = tgt.cam_depth_mm;   // 前向深度
+                valid    = 1.0f;
             }
-            serial_send_gimbal_cmd(fd, mode, dx_cm, dy_cm);
+            serial_send_plane_offset(fd, x_mm, depth_mm, valid);
         }
 
         // 6. 可视化 ───────────────────────────────
@@ -152,10 +180,14 @@ int main() {
             cmd.fire ? cv::Scalar{0,255,0} : cv::Scalar{180,180,180});
         put(3, "Pitch: " + std::to_string(cmd.pitch_err).substr(0,6) + " deg",
             cmd.fire ? cv::Scalar{0,255,0} : cv::Scalar{180,180,180});
-        put(4, "DX/DY: " + std::to_string(tgt.plane_offset_mm.x).substr(0,7) + " "
-                  + std::to_string(tgt.plane_offset_mm.y).substr(0,7) + " mm");
-        put(5, "PV:    " + std::string(tgt.plane_valid ? "1" : "0"),
-            tgt.plane_valid ? cv::Scalar{0,255,0} : cv::Scalar{120,120,120});
+        {
+            float yaw_deg = std::atan2(tgt.cam_x_mm, tgt.cam_depth_mm) * 180.0f / float(M_PI);
+            put(4, "X/Depth: " + std::to_string(tgt.cam_x_mm).substr(0,7) + " "
+                      + std::to_string(tgt.cam_depth_mm).substr(0,8) + " mm");
+            put(5, "Yaw(atan2): " + std::to_string(yaw_deg).substr(0,6) + " deg  PV:"
+                      + std::string(tgt.plane_valid ? "1" : "0"),
+                tgt.plane_valid ? cv::Scalar{0,255,0} : cv::Scalar{120,120,120});
+        }
         put(6, "Fire:  " + std::string(cmd.fire ? "ON" : "OFF"),
             cmd.fire ? cv::Scalar{0,0,255} : cv::Scalar{120,120,120});
         put(7, "IMU P/Y: " + std::to_string(cur_pitch).substr(0,5) + " "
@@ -172,14 +204,13 @@ int main() {
             recorder->record(dbg, cmd.yaw_err, cmd.pitch_err, cmd.fire ? 1.0f : 0.0f, tgt.confidence);
 
         if (fc % 30 == 0) {
-            // 串口实际发送 dx/dy 为 cm；此处 dx/dy 打印为 mm 便于交叉验证
+            // 串口发送 x_横向/y_深度(mm)；此处同时打印 yaw=atan2(x,y) 便于验证
+            float yaw_deg = std::atan2(tgt.cam_x_mm, tgt.cam_depth_mm) * 180.0f / float(M_PI);
             std::cout << "[Dart] #" << fc
-                      << (tgt.found ? " yaw=" + std::to_string(cmd.yaw_err).substr(0,6)
-                                  + " pitch=" + std::to_string(cmd.pitch_err).substr(0,6)
-                                  + " dx_mm=" + std::to_string(tgt.plane_offset_mm.x).substr(0,7)
-                                  + " dy_mm=" + std::to_string(tgt.plane_offset_mm.y).substr(0,7)
+                      << (tgt.found ? " x_mm=" + std::to_string(tgt.cam_x_mm).substr(0,7)
+                                  + " depth_mm=" + std::to_string(tgt.cam_depth_mm).substr(0,8)
+                                  + " yaw=" + std::to_string(yaw_deg).substr(0,6)
                                   + " pv=" + std::string(tgt.plane_valid ? "1" : "0")
-                                  + (cmd.fire ? " FIRE" : "")
                                 : " NO_TARGET")
                       << std::endl;
         }
