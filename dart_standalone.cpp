@@ -40,8 +40,8 @@ static int serial_open_auto(std::string &opened_port) {
 }
 
 // 海康相机参数
-static const double CAM_EXPOSURE_MS = 4.5;
-static const double CAM_GAIN        = 15.0;   // MV-CA003 增益上限约 15
+static const double CAM_EXPOSURE_MS = 2.5;
+static const double CAM_GAIN        = 7.0;    // MV-CA003 增益上限约 15，实测用 7.0
 static const char  *CAM_VID_PID     = "2bdf:0001";
 
 // 串口包录制全局指针（供无捕获函数指针回调访问）
