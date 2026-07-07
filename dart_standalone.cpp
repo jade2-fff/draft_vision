@@ -19,6 +19,7 @@
 #include <opencv2/opencv.hpp>
 
 #include "serial_protocol.h"
+#include "dart_kalman.h"
 #include "dart_detector.h"
 #include "dart_confirmer.h"
 #include "dart_solver.h"
@@ -86,6 +87,11 @@ int main() {
     int capture_id = 0;   // 标定截图计数（按 c 保存无 HUD 原图）
     float cur_pitch = 0, cur_yaw = 0, cur_roll = 0;
 
+    // 卡尔曼滤波：平滑 yaw_err 去抖（固定靶只平滑不预测）
+    Kalman1D yaw_kf(1.0, 25.0);
+    float yaw_filt = 0.f;   // 滤波后 yaw
+    auto  last_ts  = std::chrono::steady_clock::now();
+
     // 看门狗：若启动后一直取不到帧（相机卡在坏的资源上下文 0x80000006），
     // 直接退出，靠 systemd Restart=always 拉起一个全新进程重连。
     const auto start_time = std::chrono::steady_clock::now();
@@ -116,8 +122,19 @@ int main() {
         // 1. 检测（含 confirmer 确认）
         DartTarget tgt = detector.detect(frame);
 
-        // 2. 解算真角度
+        // 2. 解算真角度（相机装飞镖上，用相对光轴的角度误差 yaw_err）
         solver.solve(tgt);
+
+        // 2.5 卡尔曼平滑 yaw_err（去抖，固定靶只平滑不预测）
+        auto now_ts = std::chrono::steady_clock::now();
+        double dt = std::chrono::duration<double>(now_ts - last_ts).count();
+        last_ts = now_ts;
+        if (tgt.found) {
+            yaw_filt = float(yaw_kf.update(tgt.yaw_err, dt));
+        } else {
+            yaw_kf.reset();
+            yaw_filt = 0.f;
+        }
 
         // 3. 瞄准
         AimCommand cmd = aimer.aim(tgt);
@@ -130,18 +147,19 @@ int main() {
             }
         }
 
-        // 5. 发相机坐标系 x_横向 / y_深度(mm) + valid（14字节协议，×100，0x1021 CRC）
-        //    x = 目标相对相机的水平偏移(右为正)，y = 前向深度，原点=相机/发射点。
-        //    下位机用 yaw=atan2(x, y) 解算偏航并自行判断到位。垂直分量已丢弃。
-        //    z(valid): 1=有目标, 0=无目标。无锁存/死区，直接发实时真实值。
+        // 5. 发角度误差（14字节协议，×100，0x1021 CRC）
+        //    x字段 = yaw（卡尔曼平滑后的水平角度误差，度，右偏为正）
+        //    y字段 = 0
+        //    z字段 = valid（1=有目标, 0=无目标）
+        //    相机装飞镖上，yaw 只依赖目标在画面里的位置，与相机姿态无关，天然自洽。
+        //    下位机拿 yaw 转向让目标回画面中心，yaw≈0 时自行判断到位停止。
         {
-            float x_mm = 0, depth_mm = 0, valid = 0;
-            if (tgt.found && tgt.plane_valid) {
-                x_mm     = tgt.cam_x_mm;       // 水平偏移，右为正
-                depth_mm = tgt.cam_depth_mm;   // 前向深度
-                valid    = 1.0f;
+            float yaw = 0, valid = 0;
+            if (tgt.found) {
+                yaw   = yaw_filt;   // 卡尔曼平滑后的 yaw
+                valid = 1.0f;
             }
-            serial_send_plane_offset(fd, x_mm, depth_mm, valid);
+            serial_send_plane_offset(fd, yaw, 0.0f, valid);
         }
 
         // 6. 可视化 ───────────────────────────────
@@ -180,14 +198,10 @@ int main() {
             cmd.fire ? cv::Scalar{0,255,0} : cv::Scalar{180,180,180});
         put(3, "Pitch: " + std::to_string(cmd.pitch_err).substr(0,6) + " deg",
             cmd.fire ? cv::Scalar{0,255,0} : cv::Scalar{180,180,180});
-        {
-            float yaw_deg = std::atan2(tgt.cam_x_mm, tgt.cam_depth_mm) * 180.0f / float(M_PI);
-            put(4, "X/Depth: " + std::to_string(tgt.cam_x_mm).substr(0,7) + " "
-                      + std::to_string(tgt.cam_depth_mm).substr(0,8) + " mm");
-            put(5, "Yaw(atan2): " + std::to_string(yaw_deg).substr(0,6) + " deg  PV:"
-                      + std::string(tgt.plane_valid ? "1" : "0"),
-                tgt.plane_valid ? cv::Scalar{0,255,0} : cv::Scalar{120,120,120});
-        }
+        put(4, "Yaw raw:  " + std::to_string(tgt.yaw_err).substr(0,6) + " deg");
+        put(5, "Yaw sent: " + std::to_string(yaw_filt).substr(0,6) + " deg  V:"
+                  + std::string(tgt.found ? "1" : "0"),
+            tgt.found ? cv::Scalar{0,255,0} : cv::Scalar{120,120,120});
         put(6, "Fire:  " + std::string(cmd.fire ? "ON" : "OFF"),
             cmd.fire ? cv::Scalar{0,0,255} : cv::Scalar{120,120,120});
         put(7, "IMU P/Y: " + std::to_string(cur_pitch).substr(0,5) + " "
@@ -204,13 +218,11 @@ int main() {
             recorder->record(dbg, cmd.yaw_err, cmd.pitch_err, cmd.fire ? 1.0f : 0.0f, tgt.confidence);
 
         if (fc % 30 == 0) {
-            // 串口发送 x_横向/y_深度(mm)；此处同时打印 yaw=atan2(x,y) 便于验证
-            float yaw_deg = std::atan2(tgt.cam_x_mm, tgt.cam_depth_mm) * 180.0f / float(M_PI);
+            // 串口发送 yaw(卡尔曼平滑后的水平角度误差,度)；打印原始与滤波值便于验证
             std::cout << "[Dart] #" << fc
-                      << (tgt.found ? " x_mm=" + std::to_string(tgt.cam_x_mm).substr(0,7)
-                                  + " depth_mm=" + std::to_string(tgt.cam_depth_mm).substr(0,8)
-                                  + " yaw=" + std::to_string(yaw_deg).substr(0,6)
-                                  + " pv=" + std::string(tgt.plane_valid ? "1" : "0")
+                      << (tgt.found ? " yaw_raw=" + std::to_string(tgt.yaw_err).substr(0,6)
+                                  + " yaw_sent=" + std::to_string(yaw_filt).substr(0,6)
+                                  + " v=1"
                                 : " NO_TARGET")
                       << std::endl;
         }
