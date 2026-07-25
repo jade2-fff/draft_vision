@@ -48,6 +48,25 @@ bool DartSolver::load_camera(const std::string &path) {
 
 void DartSolver::set_boresight(const cv::Point2f &bs) { boresight_ = bs; }
 
+bool DartSolver::load_boresight(const std::string &path) {
+    cv::FileStorage fs(path, cv::FileStorage::READ);
+    if (!fs.isOpened()) return false;
+    float x = boresight_.x, y = boresight_.y;
+    if (!fs["boresight_x"].empty()) x = float((double)fs["boresight_x"]);
+    if (!fs["boresight_y"].empty()) y = float((double)fs["boresight_y"]);
+    boresight_ = cv::Point2f(x, y);
+    std::cout << "[Solver] boresight loaded: (" << x << "," << y << ")" << std::endl;
+    return true;
+}
+
+bool DartSolver::save_boresight(const std::string &path) const {
+    cv::FileStorage fs(path, cv::FileStorage::WRITE);
+    if (!fs.isOpened()) return false;
+    fs << "boresight_x" << boresight_.x;
+    fs << "boresight_y" << boresight_.y;
+    return true;
+}
+
 bool DartSolver::set_plane_pose(const cv::Mat &rvec, const cv::Mat &tvec) {
     if (rvec.empty() || tvec.empty()) return false;
 

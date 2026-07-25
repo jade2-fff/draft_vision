@@ -28,6 +28,12 @@ public:
     /** 设置镗准线像素坐标（默认画面中心） */
     void set_boresight(const cv::Point2f &bs);
 
+    /** 从 yaml 读取镗准线像素坐标（无文件则不变） */
+    bool load_boresight(const std::string &path);
+
+    /** 保存镗准线像素坐标到 yaml */
+    bool save_boresight(const std::string &path) const;
+
     /** 设置目标平面位姿（object/plane -> camera，单位随 tvec/object points，推荐 mm） */
     bool set_plane_pose(const cv::Mat &rvec, const cv::Mat &tvec);
 

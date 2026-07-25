@@ -56,14 +56,38 @@ static const char *state_str(int s) {
     }
 }
 
+static const char *CAMERA_CFG = "config/camera.yml";
+
+// 保存当前曝光/增益到 config/camera.yml
+static void save_camera_cfg(HikRobot &cam) {
+    system("mkdir -p config");
+    cv::FileStorage fs(CAMERA_CFG, cv::FileStorage::WRITE);
+    if (!fs.isOpened()) return;
+    fs << "exposure_ms" << cam.exposure_ms();
+    fs << "gain" << cam.gain();
+}
+
+// 启动时读回上次曝光/增益（没有则不变）
+static void load_camera_cfg(HikRobot &cam) {
+    cv::FileStorage fs(CAMERA_CFG, cv::FileStorage::READ);
+    if (!fs.isOpened()) return;
+    if (!fs["exposure_ms"].empty()) cam.set_exposure((double)fs["exposure_ms"]);
+    if (!fs["gain"].empty())        cam.set_gain((double)fs["gain"]);
+    std::cout << "[Cam] loaded exposure=" << cam.exposure_ms()
+              << "ms gain=" << cam.gain() << " (from " << CAMERA_CFG << ")" << std::endl;
+}
+
 int main() {
     HikRobot camera(CAM_EXPOSURE_MS, CAM_GAIN, CAM_VID_PID);
+    load_camera_cfg(camera);   // 读回上次调好的曝光/增益
     std::cout << "[Dart] 海康相机初始化（守护线程重连中）" << std::endl;
 
     DartDetector detector;
     DartSolver   solver;
     solver.load_camera("config/dart_intrinsics.yml");     // 真实内参（没有则用默认占位值）
     solver.load_plane_pose("config/dart_plane_pose.yml"); // 外参（依赖内参，先加载内参）
+    solver.load_boresight("config/boresight.yml");        // 读回上次调好的镗准线位置
+    const char *BORESIGHT_CFG = "config/boresight.yml";
     DartAimer    aimer;
 
     std::string opened_port;
@@ -149,17 +173,18 @@ int main() {
 
         // 5. 发角度误差（14字节协议，×100，0x1021 CRC）
         //    x字段 = yaw（卡尔曼平滑后的水平角度误差，度，右偏为正）
-        //    y字段 = 0
+        //    y字段 = depth（cam_depth_mm）
         //    z字段 = valid（1=有目标, 0=无目标）
         //    相机装飞镖上，yaw 只依赖目标在画面里的位置，与相机姿态无关，天然自洽。
         //    下位机拿 yaw 转向让目标回画面中心，yaw≈0 时自行判断到位停止。
         {
-            float yaw = 0, valid = 0;
+            float yaw = 0, depth = 0, valid = 0;
             if (tgt.found) {
-                yaw   = yaw_filt;   // 卡尔曼平滑后的 yaw
+                yaw   = yaw_filt * 2.49f;   // 卡尔曼平滑后的 yaw ×2.49 补偿系数
+                depth = tgt.cam_depth_mm;
                 valid = 1.0f;
             }
-            serial_send_plane_offset(fd, yaw, 0.0f, valid);
+            serial_send_plane_offset(fd, yaw, depth, valid);
         }
 
         // 6. 可视化 ───────────────────────────────
@@ -199,7 +224,7 @@ int main() {
         put(3, "Pitch: " + std::to_string(cmd.pitch_err).substr(0,6) + " deg",
             cmd.fire ? cv::Scalar{0,255,0} : cv::Scalar{180,180,180});
         put(4, "Yaw raw:  " + std::to_string(tgt.yaw_err).substr(0,6) + " deg");
-        put(5, "Yaw sent: " + std::to_string(yaw_filt).substr(0,6) + " deg  V:"
+        put(5, "Yaw/Depth: " + std::to_string(yaw_filt).substr(0,6) + " deg  V:"
                   + std::string(tgt.found ? "1" : "0"),
             tgt.found ? cv::Scalar{0,255,0} : cv::Scalar{120,120,120});
         put(6, "Fire:  " + std::string(cmd.fire ? "ON" : "OFF"),
@@ -211,7 +236,8 @@ int main() {
         put(9, "Exp/Gain: " + std::to_string(camera.exposure_ms()).substr(0,5) + "ms "
                   + std::to_string(camera.gain()).substr(0,4)
                   + "  [+/- exp, ][ gain]");
-        put(10, "[c] save calib frame -> captures/");
+        put(10, "[c]save frame  [a/d]boresight L/R x="
+                  + std::to_string(int(solver.boresight().x)));
 
         // 录像（带 HUD 的画面）
         if (recording && recorder)
@@ -222,7 +248,7 @@ int main() {
             std::cout << "[Dart] #" << fc
                       << (tgt.found ? " yaw_raw=" + std::to_string(tgt.yaw_err).substr(0,6)
                                   + " yaw_sent=" + std::to_string(yaw_filt).substr(0,6)
-                                  + " v=1"
+                                  + " depth=" + std::to_string(tgt.cam_depth_mm).substr(0,8) + " v=1"
                                 : " NO_TARGET")
                       << std::endl;
         }
@@ -235,23 +261,27 @@ int main() {
         if (key == 'q') break;
         if (key == '+' || key == '=') {
             camera.set_exposure(camera.exposure_ms() + 2.0);
+            save_camera_cfg(camera);
             std::cout << "[Cam] exposure=" << camera.exposure_ms()
-                      << "ms gain=" << camera.gain() << std::endl;
+                      << "ms gain=" << camera.gain() << " (已保存)" << std::endl;
         }
         if (key == '-' || key == '_') {
             camera.set_exposure(camera.exposure_ms() - 2.0);
+            save_camera_cfg(camera);
             std::cout << "[Cam] exposure=" << camera.exposure_ms()
-                      << "ms gain=" << camera.gain() << std::endl;
+                      << "ms gain=" << camera.gain() << " (已保存)" << std::endl;
         }
         if (key == ']') {
             camera.set_gain(camera.gain() + 2.0);
+            save_camera_cfg(camera);
             std::cout << "[Cam] exposure=" << camera.exposure_ms()
-                      << "ms gain=" << camera.gain() << std::endl;
+                      << "ms gain=" << camera.gain() << " (已保存)" << std::endl;
         }
         if (key == '[') {
             camera.set_gain(camera.gain() - 2.0);
+            save_camera_cfg(camera);
             std::cout << "[Cam] exposure=" << camera.exposure_ms()
-                      << "ms gain=" << camera.gain() << std::endl;
+                      << "ms gain=" << camera.gain() << " (已保存)" << std::endl;
         }
         if (key == 'c') {
             // 保存无 HUD 的原始帧，供 calibrate_plane_pose 使用
@@ -262,6 +292,23 @@ int main() {
                 std::cout << "[main] Saved calibration frame: " << path << std::endl;
             else
                 std::cerr << "[main] Failed to save: " << path << std::endl;
+        }
+        // 镗准线左右微调（每次1像素），自动保存到 config/boresight.yml
+        if (key == 'a' || key == 'j') {
+            cv::Point2f bo = solver.boresight();
+            bo.x -= 1.f;
+            solver.set_boresight(bo);
+            system("mkdir -p config");
+            solver.save_boresight(BORESIGHT_CFG);
+            std::cout << "[Boresight] <- x=" << bo.x << " (已保存)" << std::endl;
+        }
+        if (key == 'd' || key == 'l') {
+            cv::Point2f bo = solver.boresight();
+            bo.x += 1.f;
+            solver.set_boresight(bo);
+            system("mkdir -p config");
+            solver.save_boresight(BORESIGHT_CFG);
+            std::cout << "[Boresight] -> x=" << bo.x << " (已保存)" << std::endl;
         }
         if (key == 'r') {
             recording = !recording;
