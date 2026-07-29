@@ -81,7 +81,7 @@ void HikRobot::set_exposure(double exposure_ms) {
 
 void HikRobot::set_gain(double gain) {
     if (gain < 0.0)  gain = 0.0;
-    if (gain > 15.0) gain = 15.0;   // MV-CA003 增益上限约 15
+    if (gain > 40.0) gain = 40.0;   // 放宽增益上限到 40
     gain_ = gain;
     std::lock_guard<std::mutex> lk(param_mtx_);
     if (handle_) set_float_value("Gain", gain_);
@@ -112,7 +112,8 @@ void HikRobot::capture_start() {
         set_float_value("ExposureTime", exposure_us_);   // 重连后下发最新值
         set_float_value("Gain", gain_);
     }
-    MV_CC_SetFrameRate(handle_, 100);
+    // 不限制帧率：帧率由曝光决定，曝光可加到 set_exposure 钳制上限（100ms）
+    // MV_CC_SetFrameRate(handle_, 100);
 
     ret = MV_CC_StartGrabbing(handle_);
     if (ret != MV_OK) { std::cerr << "[HikRobot] StartGrabbing failed: 0x" << std::hex << ret << std::endl; return; }
